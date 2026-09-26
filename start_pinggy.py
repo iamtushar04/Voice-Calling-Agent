@@ -1,0 +1,1 @@
+import subprocess, time; p = subprocess.Popen(['ssh', '-p', '443', '-R0:localhost:8000', '-o', 'StrictHostKeyChecking=no', 'a.pinggy.io'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True); time.sleep(5); print(p.stdout.read(1024))
