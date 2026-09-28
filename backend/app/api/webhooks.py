@@ -64,13 +64,16 @@ async def voice_webhook(
 
     # Signature validation (skip in debug mode for local testing)
     if not settings.debug and x_twilio_signature:
+        logger.debug("webhook_validating_signature", call_sid=CallSid)
         url = f"{settings.twilio_webhook_base_url}/voice/webhook"
         form_data = dict(await request.form())
         if not twilio_adapter.validate_webhook_signature(url, form_data, x_twilio_signature):
             logger.warning("webhook_invalid_signature", call_sid=CallSid)
             raise HTTPException(status_code=403, detail="Invalid webhook signature")
+        logger.debug("webhook_signature_valid", call_sid=CallSid)
 
     # Look up our internal call record by Twilio's CallSid
+    logger.debug("webhook_looking_up_call", call_sid=CallSid)
     call_repo = CallRepository(db)
     call = await call_repo.get_by_provider_id(CallSid)
 
@@ -80,6 +83,7 @@ async def voice_webhook(
         twiml = TwilioAdapter.build_simple_say_twiml(
             "This call cannot be connected at this time. Goodbye."
         )
+        logger.info("webhook_returning_fallback_twiml", call_sid=CallSid)
         return _twiml_response(twiml)
 
     # Build the Media Stream WebSocket URL
@@ -123,7 +127,7 @@ async def status_callback(
     initiated → ringing → in-progress → completed/failed/busy/no-answer
     """
     logger.info(
-        "status_callback",
+        "status_callback_received",
         call_sid=CallSid,
         status=CallStatus,
         duration=CallDuration,
@@ -132,9 +136,11 @@ async def status_callback(
     call_repo = CallRepository(db)
     call = await call_repo.get_by_provider_id(CallSid)
     if not call:
+        logger.warning("status_callback_unknown_call_sid", call_sid=CallSid)
         return {"ok": True}
 
     call_id = call.id
+    logger.debug("status_callback_processing", call_id=str(call_id), call_sid=CallSid, status=CallStatus)
 
     # Map Twilio status to our internal status
     status_map = {
@@ -162,12 +168,14 @@ async def status_callback(
         if CallDuration:
             update_fields["duration_seconds"] = int(CallDuration)
 
+    logger.debug("status_callback_updating_db", call_id=str(call_id), internal_status=internal_status)
     await call_repo.update(call_id, **update_fields)
     await call_repo.add_event(
         call_id=call_id,
         event_type=event_type,
         payload={"twilio_status": CallStatus, "duration": CallDuration},
     )
+    logger.info("status_callback_completed", call_id=str(call_id), event_type=event_type.value)
 
     return {"ok": True}
 
@@ -182,43 +190,53 @@ async def media_stream(websocket: WebSocket, call_id: str, db: AsyncSession = De
     Twilio streams phone audio here. We stream TTS audio back.
     One WebSocket = one active call.
     """
+    logger.info("media_ws_accepting", call_id=call_id)
     await websocket.accept()
+    logger.info("media_ws_accepted", call_id=call_id)
 
-    logger.info("media_ws_connected", call_id=call_id)
-
-    # Load call + agent config from DB
-    call_repo = CallRepository(db)
+    # Load call + agent config from DB (with fallback)
+    logger.debug("media_ws_loading_call", call_id=call_id)
+    agent_config = AgentConfig()  # default fallback
+    contact_id = None
+    campaign_id = None
+    
     try:
         call_uuid = uuid.UUID(call_id)
+        call_repo = CallRepository(db)
+        call = await call_repo.get_by_id(call_uuid)
+        if call:
+            contact_id = str(call.contact_id) if call.contact_id else None
+            campaign_id = str(call.campaign_id) if call.campaign_id else None
+            logger.info("media_ws_call_loaded", call_id=call_id, contact_id=contact_id, campaign_id=campaign_id)
+        else:
+            logger.warning("media_ws_call_not_found", call_id=call_id)
     except ValueError:
         logger.error("media_ws_invalid_call_id", call_id=call_id)
         await websocket.close(code=1008)
         return
+    except Exception as exc:
+        # DB error - log but continue with default config
+        logger.error("media_ws_db_error", call_id=call_id, error=str(exc), exc_info=True)
 
-    call = await call_repo.get_by_id(call_uuid)
-    if not call:
-        logger.error("media_ws_call_not_found", call_id=call_id)
-        await websocket.close(code=1008)
-        return
-
-    # Use default agent config for now — later loaded from DB by agent_id
-    agent_config = AgentConfig()
-
+    logger.debug("media_ws_creating_handler", call_id=call_id)
     handler = MediaStreamHandler(
         call_id=call_id,
         websocket=websocket,
         agent_config=agent_config,
-        contact_id=str(call.contact_id) if call.contact_id else None,
-        campaign_id=str(call.campaign_id) if call.campaign_id else None,
+        contact_id=contact_id,
+        campaign_id=campaign_id,
     )
 
     _active_handlers[call_id] = handler
+    logger.debug("media_ws_handler_registered", call_id=call_id, active_count=len(_active_handlers))
 
     try:
         await handler.handle()
+    except Exception as exc:
+        logger.error("media_ws_handler_error", call_id=call_id, error=str(exc), exc_info=True)
     finally:
         _active_handlers.pop(call_id, None)
-        logger.info("media_ws_handler_removed", call_id=call_id)
+        logger.info("media_ws_handler_removed", call_id=call_id, active_count=len(_active_handlers))
 
 
 # ── Phase 1: Test Call ────────────────────────────────────────────────────────

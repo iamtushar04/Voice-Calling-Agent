@@ -37,3 +37,8 @@ redis_data/
 # OS
 .DS_Store
 Thumbs.db
+/tests/
+
+.env
+.env.example
+.env.example

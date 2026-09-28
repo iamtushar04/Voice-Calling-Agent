@@ -23,6 +23,9 @@ logger = get_logger(__name__)
 
 GROQ_TTS_URL = "https://api.groq.com/openai/v1/audio/speech"
 
+# Valid Groq Orpheus voices
+GROQ_VOICES = ["autumn", "diana", "hannah", "austin", "daniel", "troy"]
+
 
 class GroqTTSStream:
     """
@@ -37,10 +40,13 @@ class GroqTTSStream:
         voice_id: Optional[str] = None,
         call_id: Optional[str] = None,
     ):
-        # Groq doesn't strictly require voice ID for standard, but accepts 'alloy', etc.
-        self.voice_id = voice_id or settings.groq_tts_voice or "alloy"
+        # Use provided voice_id, or fall back to Groq voice from settings, or default to "autumn"
+        # Ensure it's a valid Groq voice
+        raw_voice = voice_id or settings.groq_tts_voice or "autumn"
+        self.voice_id = raw_voice if raw_voice in GROQ_VOICES else "autumn"
         self.call_id = call_id
         self._cancelled = False
+        logger.debug("tts_init", call_id=self.call_id, voice_id=self.voice_id)
 
     def cancel(self) -> None:
         """Signal barge-in — stop sending more audio."""
@@ -48,6 +54,7 @@ class GroqTTSStream:
         logger.info("tts_cancelled", call_id=self.call_id)
 
     def reset(self) -> None:
+        logger.debug("tts_reset", call_id=self.call_id)
         self._cancelled = False
 
     async def stream(
@@ -57,6 +64,7 @@ class GroqTTSStream:
         Stream TTS audio. Yields raw μ-law audio chunks (8kHz, mono) for Twilio.
         """
         if not text.strip():
+            logger.debug("tts_stream_skipped_empty", call_id=self.call_id)
             return
 
         self._cancelled = False
@@ -65,6 +73,7 @@ class GroqTTSStream:
 
         # Split text into chunks < 200 chars (sentence boundaries preferred)
         text_chunks = self._chunk_text(text, max_len=190)
+        logger.debug("tts_chunked_text", call_id=self.call_id, chunks=len(text_chunks), total_chars=len(text))
 
         headers = {
             "Authorization": f"Bearer {settings.groq_api_key}",
@@ -72,11 +81,12 @@ class GroqTTSStream:
         }
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            for sentence in text_chunks:
+            for i, sentence in enumerate(text_chunks):
                 if self._cancelled:
                     logger.info("tts_stream_cancelled_mid_sentence", call_id=self.call_id)
                     break
 
+                logger.debug("tts_synthesizing", call_id=self.call_id, sentence_idx=i, sentence=sentence[:50])
                 payload = {
                     "model": settings.groq_tts_model,
                     "input": sentence,
@@ -112,12 +122,15 @@ class GroqTTSStream:
                 mulaw_chunk = self._wav_to_mulaw8k(audio_bytes)
                 
                 if mulaw_chunk:
+                    logger.debug("tts_yielding_chunk", call_id=self.call_id, chunk_bytes=len(mulaw_chunk))
                     # Yield in small chunks (e.g., 4096 bytes) so Twilio doesn't buffer too much
                     chunk_size = 4096
-                    for i in range(0, len(mulaw_chunk), chunk_size):
+                    for j in range(0, len(mulaw_chunk), chunk_size):
                         if self._cancelled:
                             break
-                        yield mulaw_chunk[i:i+chunk_size]
+                        yield mulaw_chunk[j:j+chunk_size]
+                else:
+                    logger.warning("tts_empty_mulaw_chunk", call_id=self.call_id, sentence_idx=i)
 
     def _chunk_text(self, text: str, max_len: int = 190) -> list[str]:
         """Split text by punctuation, ensuring no chunk exceeds max_len."""
@@ -142,6 +155,7 @@ class GroqTTSStream:
             else:
                 chunks.append(sentence)
                 
+        logger.debug("tts_chunk_text_result", call_id=self.call_id, input_chars=len(text), output_chunks=len(chunks))
         return chunks
 
     def _wav_to_mulaw8k(self, wav_bytes: bytes) -> bytes:
@@ -150,6 +164,7 @@ class GroqTTSStream:
         Groq Orpheus returns a WAV file (typically 24kHz, 16-bit, mono).
         """
         if not wav_bytes:
+            logger.debug("tts_wav_to_mulaw_empty", call_id=self.call_id)
             return b""
             
         try:
@@ -177,5 +192,5 @@ class GroqTTSStream:
                     return b""
                     
         except Exception as exc:
-            logger.error("tts_audio_conversion_failed", error=str(exc))
+            logger.error("tts_audio_conversion_failed", call_id=self.call_id, error=str(exc), exc_info=True)
             return b""

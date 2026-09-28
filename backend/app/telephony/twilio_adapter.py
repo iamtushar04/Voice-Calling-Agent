@@ -41,6 +41,7 @@ TWILIO_STATUS_MAP = {
 
 class TwilioAdapter(TelephonyProvider):
     def __init__(self):
+        logger.debug("twilio_adapter_creating_client")
         self._client = TwilioClient(
             settings.twilio_account_sid,
             settings.twilio_auth_token,
@@ -66,14 +67,18 @@ class TwilioAdapter(TelephonyProvider):
         import asyncio
         loop = asyncio.get_event_loop()
 
-        call = await loop.run_in_executor(
-            None,
-            lambda: self._client.calls.create(
-                to=request.to_number,
-                from_=request.from_number,
-                url=request.webhook_url,
-            ),
-        )
+        try:
+            call = await loop.run_in_executor(
+                None,
+                lambda: self._client.calls.create(
+                    to=request.to_number,
+                    from_=request.from_number,
+                    url=request.webhook_url,
+                ),
+            )
+        except Exception as exc:
+            logger.error("twilio_create_call_failed", call_id=request.call_id, error=str(exc), exc_info=True)
+            raise
 
         logger.info(
             "call_created",
@@ -85,6 +90,7 @@ class TwilioAdapter(TelephonyProvider):
 
     async def hangup_call(self, provider_call_id: str) -> None:
         """Terminate an active call."""
+        logger.info("hangup_call_requested", provider_call_id=provider_call_id)
         import asyncio
         loop = asyncio.get_event_loop()
 
@@ -95,6 +101,7 @@ class TwilioAdapter(TelephonyProvider):
         logger.info("call_hung_up", provider_call_id=provider_call_id)
 
     async def get_call_status(self, provider_call_id: str) -> CallStatusInfo:
+        logger.debug("get_call_status_requested", provider_call_id=provider_call_id)
         import asyncio
         loop = asyncio.get_event_loop()
 
@@ -102,16 +109,19 @@ class TwilioAdapter(TelephonyProvider):
             None,
             lambda: self._client.calls(provider_call_id).fetch(),
         )
-        return CallStatusInfo(
+        status_info = CallStatusInfo(
             provider_call_id=call.sid,
             status=TWILIO_STATUS_MAP.get(call.status, call.status),
             duration=int(call.duration) if call.duration else None,
         )
+        logger.debug("call_status_retrieved", provider_call_id=provider_call_id, status=status_info.status, duration=status_info.duration)
+        return status_info
 
     def validate_webhook_signature(
         self, url: str, params: dict, signature: str
     ) -> bool:
         """Validate X-Twilio-Signature header to prevent webhook spoofing."""
+        logger.debug("validating_webhook_signature", url=url)
         return self._validator.validate(url, params, signature)
 
     # ── TwiML helpers ─────────────────────────────────────────────────────────
@@ -124,6 +134,7 @@ class TwilioAdapter(TelephonyProvider):
         This is returned by the webhook when a call is answered.
         Twilio will connect the phone audio to our WebSocket server.
         """
+        logger.debug("build_media_stream_twiml", call_id=call_id, media_stream_url=media_stream_url)
         response = VoiceResponse()
         connect = Connect()
         stream = Stream(url=media_stream_url)
@@ -132,7 +143,9 @@ class TwilioAdapter(TelephonyProvider):
         response.append(connect)
         # Keep call alive — the WebSocket controls when to hang up
         response.pause(length=300)
-        return str(response)
+        twiml = str(response)
+        logger.debug("build_media_stream_twiml_result", call_id=call_id, twiml=twiml)
+        return twiml
 
     @staticmethod
     def build_simple_say_twiml(message: str) -> str:
@@ -140,10 +153,13 @@ class TwilioAdapter(TelephonyProvider):
         Simple TwiML that speaks a message and hangs up.
         Used for Phase 1 test call (no streaming).
         """
+        logger.debug("build_simple_say_twiml", message_preview=message[:100])
         response = VoiceResponse()
         response.say(message, voice="alice")
         response.hangup()
-        return str(response)
+        twiml = str(response)
+        logger.debug("build_simple_say_twiml_result", twiml=twiml)
+        return twiml
 
 
 # Singleton instance

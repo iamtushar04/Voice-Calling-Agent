@@ -64,6 +64,7 @@ class GroqSTTStream:
 
     async def connect(self) -> None:
         """Initialize the local VAD stream."""
+        logger.debug("stt_connecting", call_id=self.call_id)
         self._connected = True
         self._worker_task = asyncio.create_task(self._transcription_worker())
         logger.info("groq_stt_connected (local VAD active)", call_id=self.call_id)
@@ -74,6 +75,7 @@ class GroqSTTStream:
         Detect speech, buffer it, trigger transcription on silence.
         """
         if not self._connected or not audio_bytes_mulaw:
+            logger.debug("stt_send_audio_skipped", call_id=self.call_id, connected=self._connected, has_audio=bool(audio_bytes_mulaw))
             return
 
         try:
@@ -122,10 +124,11 @@ class GroqSTTStream:
                     self._speech_buffer = bytearray()
 
         except Exception as exc:
-            logger.error("vad_processing_error", call_id=self.call_id, error=str(exc))
+            logger.error("vad_processing_error", call_id=self.call_id, error=str(exc), exc_info=True)
 
     async def close(self) -> None:
         """Stop VAD and clean up."""
+        logger.debug("stt_closing", call_id=self.call_id)
         self._connected = False
         if self._worker_task:
             self._worker_task.cancel()
@@ -136,9 +139,11 @@ class GroqSTTStream:
         try:
             while True:
                 pcm_audio = await self._transcription_queue.get()
+                logger.debug("stt_worker_processing", call_id=self.call_id, audio_bytes=len(pcm_audio))
                 await self._transcribe_with_groq(pcm_audio)
                 self._transcription_queue.task_done()
         except asyncio.CancelledError:
+            logger.debug("stt_worker_cancelled", call_id=self.call_id)
             pass
 
     async def _transcribe_with_groq(self, pcm_audio: bytes) -> None:
@@ -153,6 +158,7 @@ class GroqSTTStream:
                 wav_file.writeframes(pcm_audio)
             
             wav_bytes = wav_io.getvalue()
+            logger.debug("stt_wav_created", call_id=self.call_id, wav_bytes=len(wav_bytes))
 
             # 2. Upload to Groq
             url = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -189,7 +195,7 @@ class GroqSTTStream:
                     )
 
         except Exception as exc:
-            logger.error("groq_stt_request_failed", call_id=self.call_id, error=str(exc))
+            logger.error("groq_stt_request_failed", call_id=self.call_id, error=str(exc), exc_info=True)
 
     @staticmethod
     async def _call_cb(cb, *args):

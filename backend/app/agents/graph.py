@@ -85,6 +85,7 @@ def make_initial_state(
     contact_id: str | None = None,
     campaign_id: str | None = None,
 ) -> VoiceAgentState:
+    logger.debug("make_initial_state", call_id=call_id, contact_id=contact_id, campaign_id=campaign_id)
     return VoiceAgentState(
         call_id=call_id,
         contact_id=contact_id,
@@ -126,6 +127,11 @@ def _get_llm(agent_config: dict) -> ChatOpenAI:
 
 async def initializing_node(state: VoiceAgentState) -> dict:
     """Set up call context. Load contact info if available."""
+    # Skip if already initialized
+    if state["phase"] != AgentPhase.INITIALIZING.value:
+        logger.debug("agent_initializing_skipped", call_id=state["call_id"], phase=state["phase"])
+        return {}
+    
     logger.info(
         "agent_initializing",
         call_id=state["call_id"],
@@ -139,6 +145,11 @@ async def greeting_node(state: VoiceAgentState) -> dict:
     Generate the initial greeting using LLM.
     The audio output callback (if registered) will stream TTS.
     """
+    # Skip if already past greeting
+    if state["phase"] != AgentPhase.GREETING.value:
+        logger.debug("agent_greeting_skipped", call_id=state["call_id"], phase=state["phase"])
+        return {}
+    
     logger.info("agent_greeting", call_id=state["call_id"])
 
     agent_config = state["agent_config"]
@@ -260,9 +271,10 @@ async def speaking_node(state: VoiceAgentState) -> dict:
     if state["opted_out"]:
         return {"phase": AgentPhase.ENDING.value}
 
+    # Keep current_ai_response so handler can speak it
+    # Handler will clear it after speaking
     return {
         "phase": AgentPhase.LISTENING.value,
-        "current_ai_response": "",
         "tts_start_ms": time.time() * 1000,
     }
 
@@ -380,19 +392,18 @@ async def ending_node(state: VoiceAgentState) -> dict:
 
 def route_from_listening(state: VoiceAgentState) -> str:
     """Decide what happens after LISTENING."""
+    logger.debug("route_from_listening", call_id=state["call_id"], ended=state["ended"], has_transcript=bool(state["current_user_transcript"]))
     if state["ended"]:
         return "end"
     if state["current_user_transcript"]:
         return "thinking"
-    # Silence handling
-    silence_count = state.get("silence_count", 0)
-    max_retries = state["agent_config"].get("max_silence_retries", 2)
-    if silence_count >= max_retries:
-        return "ending"
-    return "listening"  # stay in listening, increment silence counter
+    # No transcript yet - END the graph run here.
+    # External handler will call graph again with updated state when STT arrives.
+    return "end"
 
 
 def route_from_thinking(state: VoiceAgentState) -> str:
+    logger.debug("route_from_thinking", call_id=state["call_id"], phase=state["phase"])
     if state["phase"] == AgentPhase.TOOL_EXECUTION.value:
         return "tool_execution"
     if state["phase"] == AgentPhase.ENDING.value:
@@ -401,6 +412,7 @@ def route_from_thinking(state: VoiceAgentState) -> str:
 
 
 def route_from_speaking(state: VoiceAgentState) -> str:
+    logger.debug("route_from_speaking", call_id=state["call_id"], ended=state["ended"], phase=state["phase"])
     if state["ended"]:
         return "end"
     if state["phase"] == AgentPhase.ENDING.value:
